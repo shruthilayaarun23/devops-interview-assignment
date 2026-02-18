@@ -13,3 +13,330 @@
 #
 # The application is a Java service built with Gradle, containerized,
 # deployed to EKS via kubectl/helm.
+# Pipeline overview:
+#   build → test → scan → staging deploy → production deploy (manual gate)
+#
+# Secrets required :
+#   AWS_ROLE_ARN            - IAM role for OIDC-based ECR/EKS access
+#   SLACK_WEBHOOK_URL       - Slack incoming webhook for failure notifications
+#   SONAR_TOKEN             - SonarQube token for static analysis
+#   KUBECONFIG_STAGING      - base64-encoded kubeconfig for staging EKS cluster
+#   KUBECONFIG_PRODUCTION   - base64-encoded kubeconfig for production EKS cluster
+
+name: video-analytics CI/CD
+
+on:
+  push:
+    branches:
+      - main
+      - "release/**"
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  id-token: write   # Required for OIDC AWS auth
+  contents: read
+  pull-requests: write
+
+env:
+  ECR_REGISTRY: 123456789012.dkr.ecr.us-east-1.amazonaws.com
+  IMAGE_NAME: video-processor
+  AWS_REGION: us-east-1
+  JAVA_VERSION: "17"
+
+# ============================================
+# BUILD
+# ============================================
+
+jobs:
+  build:
+    name: Build & Unit Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for SonarQube blame data
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: gradle
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v3
+
+      - name: Build and run unit tests
+        run: ./gradlew build test --no-daemon
+        env:
+          GRADLE_OPTS: "-Xmx2g"
+
+      - name: Publish test results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Unit Tests
+          path: build/test-results/test/*.xml
+          reporter: java-junit
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifact
+          path: build/libs/*.jar
+          retention-days: 7
+
+# ============================================
+# TEST (integration + security scanning)
+# ============================================
+
+  test:
+    name: Integration Tests & Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+
+    services:
+      # Local Kafka for integration tests
+      kafka:
+        image: confluentinc/cp-kafka:7.5.0
+        env:
+          KAFKA_BROKER_ID: 1
+          KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+        ports:
+          - 9092:9092
+      zookeeper:
+        image: confluentinc/cp-zookeeper:7.5.0
+        env:
+          ZOOKEEPER_CLIENT_PORT: 2181
+        ports:
+          - 2181:2181
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: gradle
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifact
+          path: build/libs/
+
+      - name: Run integration tests
+        run: ./gradlew integrationTest --no-daemon
+        env:
+          KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+
+      - name: Run SonarQube analysis
+        run: ./gradlew sonar --no-daemon
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonar.internal.vlt.io
+
+      - name: Scan for vulnerabilities with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: 1          # Fail the pipeline on HIGH/CRITICAL findings
+          format: sarif
+          output: trivy-results.sarif
+
+      - name: Upload Trivy results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+# ============================================
+# BUILD & PUSH DOCKER IMAGE
+# ============================================
+
+  docker:
+    name: Build & Push Image to ECR
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+      image_uri: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=,format=short
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          severity: HIGH,CRITICAL
+          exit-code: 1
+
+# ============================================
+# DEPLOY TO STAGING
+# ============================================
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: docker
+    environment: staging
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configure kubectl for staging
+        run: |
+          echo "${{ secrets.KUBECONFIG_STAGING }}" | base64 -d > kubeconfig
+          echo "KUBECONFIG=$(pwd)/kubeconfig" >> $GITHUB_ENV
+
+      - name: Deploy to staging
+        run: |
+          python deploy.py deploy \
+            --environment staging \
+            --image-tag ${{ needs.docker.outputs.image_tag }}
+
+      - name: Notify on staging failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": ":red_circle: *Staging deploy failed*",
+              "attachments": [{
+                "color": "danger",
+                "fields": [
+                  {"title": "Image", "value": "${{ needs.docker.outputs.image_tag }}", "short": true},
+                  {"title": "Branch", "value": "${{ github.ref_name }}", "short": true},
+                  {"title": "Run", "value": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}", "short": false}
+                ]
+              }]
+            }
+
+# ============================================
+# DEPLOY TO PRODUCTION (manual approval gate)
+# ============================================
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [docker, deploy-staging]
+    # GitHub Environment with required reviewers configured in repo settings
+    # This is the manual approval gate — a named reviewer must approve before this job runs
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configure kubectl for production
+        run: |
+          echo "${{ secrets.KUBECONFIG_PRODUCTION }}" | base64 -d > kubeconfig
+          echo "KUBECONFIG=$(pwd)/kubeconfig" >> $GITHUB_ENV
+
+      - name: Deploy to production
+        id: deploy
+        run: |
+          python deploy.py deploy \
+            --environment production \
+            --image-tag ${{ needs.docker.outputs.image_tag }}
+
+      # Automatic rollback is handled inside deploy.py on health check failure.
+      # This step fires if deploy.py exits non-zero (i.e. rollback also failed).
+      - name: Notify on production failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": ":fire: *Production deploy FAILED — MANUAL INTERVENTION REQUIRED*",
+              "attachments": [{
+                "color": "danger",
+                "fields": [
+                  {"title": "Image", "value": "${{ needs.docker.outputs.image_tag }}", "short": true},
+                  {"title": "Branch", "value": "${{ github.ref_name }}", "short": true},
+                  {"title": "Run", "value": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}", "short": false}
+                ]
+              }]
+            }
+
+      - name: Notify on production success
+        if: success()
+        uses: slackapi/slack-github-action@v1
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": ":white_check_mark: *Production deploy succeeded*",
+              "attachments": [{
+                "color": "good",
+                "fields": [
+                  {"title": "Image", "value": "${{ needs.docker.outputs.image_tag }}", "short": true},
+                  {"title": "Branch", "value": "${{ github.ref_name }}", "short": true}
+                ]
+              }]
+            }
