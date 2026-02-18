@@ -5,3 +5,24 @@
 # Requirements:
 #   - Application configuration values (e.g., log level, Kafka broker, S3 bucket)
 #   - This ConfigMap should be referenced in your deployment.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: video-processor-config
+  namespace: video-analytics
+  labels:
+    app: video-processor
+data:
+  # Kafka - MSK bootstrap endpoint (update per environment)
+  KAFKA_BOOTSTRAP_SERVERS: "b-1.video-analytics.kafka.us-east-1.amazonaws.com:9092,b-2.video-analytics.kafka.us-east-1.amazonaws.com:9092"
+  KAFKA_CONSUMER_GROUP: "video-processor-group"
+
+  # S3 - video chunks bucket (matches vlt-video-chunks-prod in cost report)
+  S3_VIDEO_BUCKET: "vlt-video-chunks-prod"
+
+  # AWS
+  AWS_REGION: "us-east-1"
+
+  # Application
+  LOG_LEVEL: "info"
+  CHUNK_DURATION_SECONDS: "30"   # Fragment size for MPEG-TS chunk concatenation

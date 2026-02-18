@@ -1,4 +1,4 @@
-# hpa.yaml — Horizontal Pod Autoscaler
+# hpa.yaml - Horizontal Pod Autoscaler
 #
 # TASK: Create an HPA for the video-processor deployment.
 #
@@ -6,3 +6,59 @@
 #   - Min and max replica counts
 #   - CPU and/or memory metrics with target utilization
 #   - Consider: what scaling behavior makes sense for a video processing workload?
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: video-processor
+  namespace: video-analytics
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: video-processor
+
+  minReplicas: 3  # Matches deployment replicas; never drop below 1 per AZ
+  maxReplicas: 12 # Matches node group max in cost_optimization.tf
+
+  metrics:
+    # CPU: primary scaling signal - Kafka Streams is CPU-bound during frame processing
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70  # Scale before saturation; leaves headroom for burst ingest
+
+    # Memory: secondary signal - guards against slow leaks during long-running stream jobs
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+  behavior:
+    # Scale UP aggressively - a sudden camera ingest spike (e.g. site-wide motion event)
+    # can double the message backlog in seconds. Better to over-provision briefly than
+    # drop frames or grow Kafka lag.
+    scaleUp:
+      stabilizationWindowSeconds: 30   # React quickly to sustained load
+      policies:
+        - type: Pods
+          value: 3                      # Add up to 3 pods per window
+          periodSeconds: 60
+        - type: Percent
+          value: 100                    # Or double the current count, whichever is larger
+          periodSeconds: 60
+      selectPolicy: Max
+
+    # Scale DOWN conservatively - video workloads are bursty and spiky by nature.
+    # Scaling down too fast causes repeated scale-up/down churn (thrashing) and
+    # Kafka consumer group rebalancing on every change, which pauses processing.
+    scaleDown:
+      stabilizationWindowSeconds: 300  # Wait 5 minutes of sustained low load before shrinking
+      policies:
+        - type: Pods
+          value: 1                      # Remove at most 1 pod per window
+          periodSeconds: 120
+      selectPolicy: Min

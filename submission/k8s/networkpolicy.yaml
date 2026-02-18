@@ -1,4 +1,4 @@
-# networkpolicy.yaml — Network Policy
+# networkpolicy.yaml - Network Policy
 #
 # TASK: Create a NetworkPolicy for the video-processor pods.
 #
@@ -6,3 +6,86 @@
 #   - Restrict ingress to only necessary sources
 #   - Consider what services need to communicate with the video processor
 #   - Default deny is a good starting point
+# Traffic map (from architecture doc):
+#
+#   INGRESS to video-processor:
+#     - None expected - video-processor is a pure consumer (Kafka Streams).
+#       It pulls from MSK and writes to S3; nothing calls into it directly.
+#       The ALB and API Gateway front customer traffic, not this service.
+#
+#   EGRESS from video-processor:
+#     - MSK (Kafka)     port 9092/9094  - consume video fragment events
+#     - S3              port 443        - upload concatenated video chunks
+#     - RDS (Postgres)  port 5432       - write metadata after processing
+#     - CloudWatch/DNS  port 443/53     - metrics, logs, service discovery
+#
+# Default deny is applied first via a dedicated policy, then explicit egress
+# rules open only what is needed.
+---
+# 1. Default deny all ingress and egress for video-processor pods
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: video-processor-default-deny
+  namespace: video-analytics
+spec:
+  podSelector:
+    matchLabels:
+      app: video-processor
+  policyTypes:
+    - Ingress
+    - Egress
+
+---
+# 2. Explicit allow policy
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: video-processor-allow
+  namespace: video-analytics
+spec:
+  podSelector:
+    matchLabels:
+      app: video-processor
+  policyTypes:
+    - Ingress
+    - Egress
+
+  ingress:
+    # Prometheus scraping from the monitoring namespace only
+    # (no other service needs to call into the video processor)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app: prometheus
+      ports:
+        - port: 8080
+          protocol: TCP
+
+  egress:
+    # MSK (Kafka) - plaintext and TLS ports
+    - ports:
+        - port: 9092
+          protocol: TCP
+        - port: 9094   # TLS
+          protocol: TCP
+
+    # S3 and AWS APIs (CloudWatch, Secrets Manager, ECR) - all HTTPS via NAT gateway
+    - ports:
+        - port: 443
+          protocol: TCP
+
+    # RDS PostgreSQL - metadata writes after chunk processing
+    - ports:
+        - port: 5432
+          protocol: TCP
+
+    # DNS - required for MSK/S3 endpoint resolution
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
