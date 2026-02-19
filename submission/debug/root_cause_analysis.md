@@ -10,6 +10,7 @@ At 08:15 UTC on 12 November 2025, a scheduled network maintenance change (NET-45
 
 <!-- Reconstruct the incident timeline from the available data. Include timestamps. -->
 | Time (UTC)   | Event                                                                                  |
+|--------------|----------------------------------------------------------------------------------------|
 | 07:30-08:10  | All systems normal. Upload success rate 100%, avg throughput 41-44 Mbps                |
 | 08:15        | NET-4521 applied - `eno1` MTU changed from 1500 to 9000 via netplan                    |
 | 08:15        | strongSwan logs: IKE SA keepalive packet size 9000 exceeds path MTU 1500               |
