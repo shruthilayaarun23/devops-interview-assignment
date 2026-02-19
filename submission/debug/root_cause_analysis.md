@@ -63,7 +63,7 @@ Path MTU Discovery (PMTUD) failed because the DF bit was set on ESP packets, and
 
 <!-- Link specific log entries, metrics, and data points that support your analysis -->
 | Evidence                                                                                           | Source  | Significance |
-|------------------------------------|-------------------|---------------------------------------------------------------------|
+|----------------------------------------------------------------------------------------------------|---------|--------------|
 | `eno1: MTU changed from 1500 to 9000 via netplan apply` at 08:15                                   | syslog  | Confirms exact time and cause of misconfiguration |
 | `IKE SA keepalive: packet size 9000 exceeds path MTU 1500` at 08:15                                | VPN log | strong Swan immediately detected the MTU conflict |
 | `fragmentation needed and DF set, mtu=1500` at 08:18                                               | syslog  | Gateway rejecting oversized packets |
