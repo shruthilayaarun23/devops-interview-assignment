@@ -2,6 +2,7 @@
 
 ## Incident Summary
 | Field             | Value                                                                                                                                     |
+|-------------- ----|-------------------------------------------------------------------------------------------------------------------------------------------|
 | Date              | 2025-11-12                                                                                                                                |
 | Duration          | 45 minutes (08:15 - 09:00 UTC)                                                                                                            |
 | Severity          | P1                                                                                                                                        |
@@ -19,6 +20,7 @@ A scheduled network maintenance change (NET-4521) intended to enable jumbo frame
 
 <!-- Detailed timeline with timestamps -->
 | Time (UTC)    | Event                                                                |
+|---------------|----------------------------------------------------------------------|
 | 07:30 - 08:10 | All systems normal, uploads running at 41-44 Mbps                    |
 | 08:15         | NET-4521 applied - `eno1` MTU changed from 1500 to 9000              |
 | 08:15         | strongSwan: keepalive packet size exceeds path MTU                   |
@@ -63,6 +65,7 @@ The NOC engineer reverted `eno1` MTU to 1500 via `ip link set` and corrected the
 <!-- Specific, assignable action items to prevent recurrence -->
 
 | Action                                                                                 | Owner         | Priority | Due Date   |
+|----------------------------------------------------------------------------------------|---------------|----------|------------|
 | Add MTU validation for `eno1` to `healthcheck.sh`                                      | Edge Platform | High     | 2025-11-19 |
 | Split netplan config into per-interface files (`10-management.yaml`, `20-camera.yaml`) | Edge Platform | High     | 2025-11-19 |
 | Add pre-apply connectivity test to all network change scripts                          | Edge Platform | High     | 2025-11-26 |
